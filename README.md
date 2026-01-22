@@ -81,7 +81,8 @@ headers = {
 }
 
 res = requests.get(url, headers=headers)
-print(res.json())```
+print(res.json())
+```
 
 ## ⚠️ 注意事项
 
