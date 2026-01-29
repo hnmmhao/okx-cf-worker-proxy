@@ -1,95 +1,95 @@
-/**
- * OKX Cloudflare Proxy (Production Ready)
- * 1. 支持 CORS，方便本地前端调试
- * 2. 自动处理 HTTP/WebSocket
- * 3. 模拟盘/实盘自动路由
- */
+export default {
+  async fetch(request, env, ctx) {
+      const upgradeHeader = request.headers.get('Upgrade');
+      const url = new URL(request.url);
 
-const UPSTREAM_REAL = 'ws.okx.com';
-const UPSTREAM_SIM = 'wspap.okx.com';
-const REST_REAL = 'www.okx.com';
+      // ================= 配置区域 =================
+      const HOST_REST = 'www.okx.com';
+      const HOST_WS_REAL = 'ws.okx.com:8443';
+      const HOST_WS_SIM = 'wspap.okx.com:8443';
+      // ===========================================
 
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
+      if (upgradeHeader === 'websocket') {
+          const isSim = url.searchParams.get('sim') === '1';
+          url.searchParams.delete('sim');
+          const targetHost = isSim ? HOST_WS_SIM : HOST_WS_REAL;
+          const targetUrl = `wss://${targetHost}${url.pathname}${url.search}`;
 
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  const upgradeHeader = request.headers.get('Upgrade');
-  
-  // === 1. 处理 WebSocket 连接 ===
-  if (upgradeHeader === 'websocket') {
-    const isSim = url.searchParams.get('sim') === '1';
-    const targetHost = isSim ? UPSTREAM_SIM : UPSTREAM_REAL;
-    
-    // 构建上游 URL，保留路径但不带 Query (OKX WS 鉴权不认多余参数)
-    const upstreamUrl = new URL(url.pathname, `https://${targetHost}`);
-    
-    // 初始化 WS 请求
-    const newRequest = new Request(upstreamUrl, request);
-    
-    // 关键：Cloudflare Workers 处理 WS 需要 fetch
-    const response = await fetch(newRequest);
-    
-    // 创建 WebSocket 对 (Client <-> Worker <-> OKX)
-    const [client, server] = Object.values(new WebSocketPair());
-    
-    // 建立连接
-    server.accept();
-    response.webSocket.accept();
+          // 1. 建立与 OKX 的连接
+          const okxSocket = new WebSocket(targetUrl);
 
-    // 管道转发：Client -> OKX
-    server.addEventListener('message', event => {
-        response.webSocket.send(event.data);
-    });
+          // 2. 建立与客户端的连接
+          const { 0: client, 1: server } = new WebSocketPair();
 
-    // 管道转发：OKX -> Client
-    response.webSocket.addEventListener('message', event => {
-        server.send(event.data);
-    });
+          // 3. 【关键修改】接受连接，并准备消息队列
+          server.accept();
+          let messageQueue = []; // 暂存消息的队列
+          let isBackendReady = false;
 
-    // 错误与关闭处理
-    const closeHandler = () => {
-        try { server.close(); } catch(e){}
-        try { response.webSocket.close(); } catch(e){}
-    };
-    
-    server.addEventListener('close', closeHandler);
-    response.webSocket.addEventListener('close', closeHandler);
-    server.addEventListener('error', closeHandler);
-    response.webSocket.addEventListener('error', closeHandler);
+          // 4. 立即监听客户端发来的消息
+          server.addEventListener('message', event => {
+              if (isBackendReady) {
+                  // 如果后台连上了，直接发
+                  try { okxSocket.send(event.data); } catch (e) { }
+              } else {
+                  // 如果后台没连上，先存进队列
+                  messageQueue.push(event.data);
+              }
+          });
 
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-    });
-  }
+          // 5. 监听 OKX 连接成功事件
+          okxSocket.addEventListener('open', () => {
+              isBackendReady = true;
 
-  // === 2. 处理 REST API (HTTP) ===
-  const isSimHttp = request.headers.get('x-simulated-trading') === '1';
-  // 注意：REST API 模拟盘通常也是 www.okx.com，只是通过 Header 区分，
-  // 除非是特定的模拟盘独立域名。OKX V5 API 统一入口通常是 www.okx.com
-  const targetHostHttp = REST_REAL; 
+              // 把队列里暂存的消息全部发出去
+              while (messageQueue.length > 0) {
+                  const msg = messageQueue.shift();
+                  try { okxSocket.send(msg); } catch (e) { }
+              }
 
-  const upstreamUrl = new URL(url.pathname + url.search, `https://${targetHostHttp}`);
-  
-  // 构造新请求
-  const newRequest = new Request(upstreamUrl, {
-    method: request.method,
-    headers: request.headers,
-    body: request.body
-  });
+              // 设置反向转发：OKX -> 客户端
+              okxSocket.addEventListener('message', event => {
+                  try { server.send(event.data); } catch (e) { }
+              });
+          });
 
-  // 强制覆盖 Host 头，否则 OKX 会拒绝
-  newRequest.headers.set('Host', targetHostHttp);
-  
-  const response = await fetch(newRequest);
+          // 6. 错误与关闭处理
+          const closeBoth = () => {
+              try { server.close(); } catch (e) { }
+              try { okxSocket.close(); } catch (e) { }
+          };
+          server.addEventListener('close', closeBoth);
+          okxSocket.addEventListener('close', closeBoth);
+          server.addEventListener('error', closeBoth);
+          okxSocket.addEventListener('error', closeBoth);
 
-  // === 3. 处理 CORS (关键：解决本地 localhost 调试跨域问题) ===
-  const newResponse = new Response(response.body, response);
-  newResponse.headers.set('Access-Control-Allow-Origin', '*');
-  newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  newResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, x-simulated-trading, OK-ACCESS-KEY, OK-ACCESS-SIGN, OK-ACCESS-TIMESTAMP, OK-ACCESS-PASSPHRASE');
+          return new Response(null, { status: 101, webSocket: client });
+      }
 
-  return newResponse;
-}
+      // HTTP 处理保持不变
+      url.hostname = HOST_REST;
+      url.searchParams.delete('sim');
+      // 修正 Headers: 必须移除 Host 头，否则 OKX 会因为 SNI 不匹配返回 403/404
+      const newHeaders = new Headers(request.headers);
+      newHeaders.delete('Host');
+      newHeaders.delete('cf-connecting-ip'); // 可选：移除 CF 内部头
+
+      const newRequest = new Request(url.toString(), {
+          method: request.method,
+          headers: newHeaders,
+          body: request.body,
+          redirect: 'follow'
+      });
+
+      try {
+          const response = await fetch(newRequest);
+          const newResponse = new Response(response.body, response);
+          newResponse.headers.set('Access-Control-Allow-Origin', '*');
+          newResponse.headers.set('Access-Control-Allow-Headers', '*');
+          newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+          return newResponse;
+      } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+      }
+  },
+};
